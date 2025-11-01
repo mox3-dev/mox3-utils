@@ -1,0 +1,210 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+
+      - name: Install Composer dependencies
+        run: composer install -o --no-dev --prefer-dist --no-interaction
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install npm dependencies
+        run: npm install
+
+      - name: Build assets
+        run: npm run build
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_CLOUDWAYS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ vars.DEPLOY_CLOUDWAYS_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Create rsync excludes file
+        run: |
+          cat > .rsync-excludes << 'EOF'
+          .git/
+          .github/
+          node_modules/
+          database/*.sqlite
+          storage/app/*
+          storage/framework/cache/*
+          storage/framework/sessions/*
+          storage/framework/testing/*
+          storage/framework/views/*
+          storage/logs/*
+          .env
+          .env.*
+          .phpunit.result.cache
+          tests/
+          phpunit.xml
+          EOF
+
+      - name: Deploy to server
+        run: |
+          rsync -rlDvz --delete --checksum \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
+            --exclude-from='.rsync-excludes' \
+            --info=progress2 \
+            . ${{ vars.DEPLOY_CLOUDWAYS_USER }}@${{ vars.DEPLOY_CLOUDWAYS_HOST }}:${{ vars.DEPLOY_PATH }}
+
+      - name: Run post-deployment commands
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ vars.DEPLOY_CLOUDWAYS_USER }}@${{ vars.DEPLOY_CLOUDWAYS_HOST }} << 'EOF'
+            cd ${{ vars.DEPLOY_PATH }}
+            php artisan migrate --force
+            php artisan config:cache
+            php artisan route:cache
+          EOF
+
+      - name: Reset file permissions via Cloudways API
+        run: |
+          # Get access token
+          ACCESS_TOKEN=$(curl -s -X POST \
+            --header 'Content-Type: application/x-www-form-urlencoded' \
+            --header 'Accept: application/json' \
+            -d 'email=${{ secrets.CLOUDWAYS_EMAIL }}&api_key=${{ secrets.CLOUDWAYS_API_KEY }}' \
+            'https://api.cloudways.com/api/v1/oauth/access_token' | grep -o '"access_token":"[^"]*' | cut -d'"' -f4)
+
+          # Reset file permissions
+          curl -X POST \
+            --header 'Content-Type: application/x-www-form-urlencoded' \
+            --header 'Accept: application/json' \
+            --header "Authorization: Bearer $ACCESS_TOKEN" \
+            -d 'server_id=${{ vars.CLOUDWAYS_SERVER_ID }}&app_id=${{ vars.CLOUDWAYS_APP_ID }}' \
+            'https://api.cloudways.com/api/v1/app/manage/reset_permissions'
+
+      - name: Send Slack notification on success
+        if: success()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "✅ Deployment Successful - ${{ github.repository }}",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "✅ Deployment Successful"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Repository:*\n${{ github.repository }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Branch:*\n${{ github.ref_name }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Author:*\n${{ github.event.head_commit.author.name }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Commit"
+                      },
+                      "url": "${{ github.event.head_commit.url }}"
+                    },
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Workflow"
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Send Slack notification on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "❌ Deployment Failed - ${{ github.repository }}",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "❌ Deployment Failed"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Repository:*\n${{ github.repository }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Branch:*\n${{ github.ref_name }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Author:*\n${{ github.event.head_commit.author.name }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Commit"
+                      },
+                      "url": "${{ github.event.head_commit.url }}"
+                    },
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Workflow"
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
