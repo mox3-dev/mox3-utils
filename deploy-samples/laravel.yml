@@ -61,7 +61,7 @@ jobs:
 
       - name: Deploy to server
         run: |
-          rsync -rlDvz --delete --checksum \
+          rsync -rlptvz --delete --checksum \
             -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
             --exclude-from='.rsync-excludes' \
             --info=progress2 \
