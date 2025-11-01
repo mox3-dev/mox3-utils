@@ -19,8 +19,10 @@ The sample deployment workflow is designed for Laravel applications and includes
 
 **Deployment Process:**
 - SSH-based deployment using rsync to Cloudways hosting
+- Uses `rsync -rlpvz` flags (recursive, symlinks, permissions, verbose, compression)
+- Note: `-t` (preserve times) flag excluded due to Cloudways hosting restrictions
 - Excludes: `.git`, `node_modules`, database files, `storage`, and `.env`
-- Preserves file permissions on the server
+- File permissions reset via Cloudways API after deployment
 
 **Post-Deployment Commands:**
 ```bash
