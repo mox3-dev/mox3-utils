@@ -87,4 +87,44 @@ class AccessSettingsTest extends TestCase
 
         $this->assertNotSame($a->identity(), $b->identity());
     }
+
+    public function test_describe_shows_ssh_target_not_localhost_for_ssh_access(): void
+    {
+        $s = AccessSettings::fromConnection('production', [
+            'host' => '127.0.0.1', 'port' => 3306, 'username' => 'u', 'password' => 'p', 'database' => 'app',
+        ], $this->env(['PRODUCTION_ACCESS' => 'ssh', 'PRODUCTION_SSH' => 'forge@1.2.3.4']));
+
+        $desc = $s->describe();
+        $this->assertStringContainsString('forge@1.2.3.4', $desc);
+        $this->assertStringContainsString('ssh', $desc);
+        $this->assertStringNotContainsString('127.0.0.1', $desc);
+    }
+
+    public function test_describe_shows_tunnel_remote_and_bastion_for_tunnel_access(): void
+    {
+        $s = AccessSettings::fromConnection('production', [
+            'host' => '127.0.0.1', 'port' => 3306, 'username' => 'u', 'password' => 'p', 'database' => 'app',
+        ], $this->env([
+            'PRODUCTION_ACCESS' => 'tunnel',
+            'PRODUCTION_TUNNEL_SSH' => 'bastion@ec2',
+            'PRODUCTION_TUNNEL_REMOTE' => 'db.internal:3306',
+            'PRODUCTION_TUNNEL_LOCAL_PORT' => '13306',
+        ]));
+
+        $desc = $s->describe();
+        $this->assertStringContainsString('db.internal:3306', $desc);
+        $this->assertStringContainsString('bastion@ec2', $desc);
+        $this->assertStringContainsString('tunnel', $desc);
+    }
+
+    public function test_describe_shows_host_port_for_direct_access(): void
+    {
+        $s = AccessSettings::fromConnection('production', [
+            'host' => 'db.example.com', 'port' => 3306, 'username' => 'u', 'password' => 'p', 'database' => 'app',
+        ], $this->env([]));
+
+        $desc = $s->describe();
+        $this->assertStringContainsString('db.example.com:3306', $desc);
+        $this->assertStringContainsString('direct', $desc);
+    }
 }

@@ -237,10 +237,10 @@ class SyncProductionDatabase extends Command
     {
         $dest = $dumpOnly || $target === null
             ? 'none (dump only — writes a file)'
-            : sprintf('%s @ %s:%s  (DROPPED + recreated)', $target->database, $target->effectiveHost(), $target->effectivePort());
+            : $target->describe().'  (DROPPED + recreated)';
 
         $this->table(['Setting', 'Value'], [
-            ['Source', sprintf('%s @ %s:%s [%s]', $source->database, $source->effectiveHost(), $source->effectivePort(), $source->access)],
+            ['Source', $source->describe()],
             ['Destination', $dest],
             ['Data only', $this->option('data-only') ? 'yes' : 'no'],
         ]);

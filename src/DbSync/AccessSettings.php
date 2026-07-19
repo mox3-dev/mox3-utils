@@ -77,4 +77,18 @@ final class AccessSettings
 
         return strtolower(trim($host)).':'.trim($port);
     }
+
+    /**
+     * Human-readable description of where this endpoint physically lives, with
+     * the access strategy made explicit — so an ssh/tunnel source is never
+     * mistaken for localhost in command output.
+     */
+    public function describe(): string
+    {
+        return match ($this->access) {
+            'ssh' => sprintf('%s @ %s (ssh → remote MySQL)', $this->database, $this->sshTarget),
+            'tunnel' => sprintf('%s @ %s (tunnel via %s, local :%s)', $this->database, $this->tunnelRemote, $this->sshTarget, $this->tunnelLocalPort),
+            default => sprintf('%s @ %s:%s (direct)', $this->database, $this->host, $this->port),
+        };
+    }
 }
