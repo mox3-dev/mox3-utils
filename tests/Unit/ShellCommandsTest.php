@@ -58,4 +58,28 @@ class ShellCommandsTest extends TestCase
         $this->assertStringContainsString('gunzip <', $cmd);
         $this->assertStringContainsString('--defaults-extra-file', $cmd);
     }
+
+    public function test_ssh_dump_command_ships_credentials_as_base64_over_ssh_stdin(): void
+    {
+        $cmd = ShellCommands::sshDumpCommand(
+            'forge@host', 'app', '--single-transaction', 'root', 's3cr3t"pw', '/tmp/out.sql.gz'
+        );
+
+        // Heredoc binds to ssh (before the gzip pipe) so the remote actually runs.
+        $this->assertMatchesRegularExpression("/ssh .* bash -s <<'MOXDUMP' \\| gzip > /s", $cmd);
+        // Password never appears in plaintext — it travels inside the base64 blob.
+        $this->assertStringNotContainsString('s3cr3t"pw', $cmd);
+        $expectedConfig = "[client]\nuser=\"root\"\npassword=\"s3cr3t\\\"pw\"\n";
+        $this->assertStringContainsString(base64_encode($expectedConfig), $cmd);
+        // Database is single-quoted in the remote mysqldump invocation.
+        $this->assertStringContainsString("--defaults-extra-file=\"\$CNF\" --single-transaction 'app'", $cmd);
+        // No -p password flag anywhere.
+        $this->assertStringNotContainsString(' -p', $cmd);
+    }
+
+    public function test_reset_database_sql_escapes_backticks_in_name(): void
+    {
+        $sql = ShellCommands::resetDatabaseSql('we`ird');
+        $this->assertStringContainsString('DROP DATABASE IF EXISTS `we``ird`', $sql);
+    }
 }

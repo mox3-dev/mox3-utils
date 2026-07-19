@@ -24,10 +24,12 @@ final class ShellCommands
 
     public static function resetDatabaseSql(string $database, string $charset = self::CHARSET): string
     {
+        $name = str_replace('`', '``', $database);
+
         return sprintf(
             'SET FOREIGN_KEY_CHECKS=0; DROP DATABASE IF EXISTS `%1$s`; '
             .'CREATE DATABASE `%1$s` CHARACTER SET %2$s COLLATE %2$s_unicode_ci; SET FOREIGN_KEY_CHECKS=1;',
-            $database,
+            $name,
             $charset
         );
     }
@@ -64,29 +66,54 @@ final class ShellCommands
 
     /**
      * Dump a remote DB by running mysqldump over SSH. The remote reads its
-     * credentials from a temp 0600 option file that we create by streaming a
-     * heredoc over SSH stdin — so the password never appears in any argv.
+     * credentials from a temp 0600 option file we ship as base64 over the SSH
+     * stdin (a quoted heredoc bound to ssh, before the gzip pipe) — so no
+     * password ever reaches any argv, the base64 payload cannot collide with
+     * the heredoc terminator, and the database name is single-quoted against
+     * remote injection. ssh's stdout is piped to gzip into the local dump file.
      */
-    public static function sshDumpCommand(string $sshTarget, string $database, string $options, string $username, string $password, string $dumpFile): string
-    {
-        $remoteScript = <<<SCRIPT
-                CNF="\$(mktemp)"; chmod 600 "\$CNF"
-                cat > "\$CNF" <<'CNFEOF'
-                [client]
-                user={$username}
-                password="{$password}"
-                CNFEOF
-                mysqldump --defaults-extra-file="\$CNF" {$options} {$database}
-                rc=\$?
-                rm -f "\$CNF"
-                exit \$rc
-                SCRIPT;
+    public static function sshDumpCommand(
+        string $sshTarget,
+        string $database,
+        string $options,
+        string $username,
+        string $password,
+        string $dumpFile
+    ): string {
+        $clientConfig = "[client]\n"
+            .'user="'.self::escapeOptionValue($username)."\"\n"
+            .'password="'.self::escapeOptionValue($password)."\"\n";
+
+        $script = implode("\n", [
+            'CNF="$(mktemp)" || exit 1',
+            'chmod 600 "$CNF"',
+            "printf '%s' ".self::singleQuote(base64_encode($clientConfig)).' | base64 -d > "$CNF"',
+            'mysqldump --defaults-extra-file="$CNF" '.$options.' '.self::singleQuote($database),
+            'rc=$?',
+            'rm -f "$CNF"',
+            'exit $rc',
+        ]);
 
         return sprintf(
-            'ssh -o StrictHostKeyChecking=no %s bash -s | gzip > %s',
+            "ssh -o StrictHostKeyChecking=no %s bash -s <<'MOXDUMP' | gzip > %s\n%s\nMOXDUMP",
             escapeshellarg($sshTarget),
-            escapeshellarg($dumpFile)
-        ).' <<<'.escapeshellarg($remoteScript);
+            escapeshellarg($dumpFile),
+            $script
+        );
+    }
+
+    private static function escapeOptionValue(string $value): string
+    {
+        return str_replace(
+            ['\\', '"', "\n", "\r", "\t"],
+            ['\\\\', '\\"', '\\n', '\\r', '\\t'],
+            $value
+        );
+    }
+
+    private static function singleQuote(string $value): string
+    {
+        return "'".str_replace("'", "'\\''", $value)."'";
     }
 
     public static function importCommand(string $mysqlBin, string $cnf, string $database, string $dumpFile): string
