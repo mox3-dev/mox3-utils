@@ -262,7 +262,7 @@ class SyncProductionDatabase extends Command
 
     private function runShell(string $command, string $label): void
     {
-        $process = Process::fromShellCommandline('set -o pipefail; '.$command);
+        $process = new Process(['bash', '-c', 'set -o pipefail; '.$command]);
         $process->setTimeout(null);
         $process->run(function (string $type, string $buffer): void {
             $filtered = preg_replace('/.*Using a password on the command line.*\n?/', '', $buffer);
