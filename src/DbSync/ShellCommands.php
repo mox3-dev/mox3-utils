@@ -71,6 +71,9 @@ final class ShellCommands
      * password ever reaches any argv, the base64 payload cannot collide with
      * the heredoc terminator, and the database name is single-quoted against
      * remote injection. ssh's stdout is piped to gzip into the local dump file.
+     * The database name also travels as base64 and is decoded into a remote
+     * shell variable, so untrusted bytes (e.g. a newline matching the heredoc
+     * terminator) are never embedded as literal text in the local heredoc body.
      */
     public static function sshDumpCommand(
         string $sshTarget,
@@ -88,7 +91,8 @@ final class ShellCommands
             'CNF="$(mktemp)" || exit 1',
             'chmod 600 "$CNF"',
             "printf '%s' ".self::singleQuote(base64_encode($clientConfig)).' | base64 -d > "$CNF"',
-            'mysqldump --defaults-extra-file="$CNF" '.$options.' '.self::singleQuote($database),
+            "DB=\"\$(printf '%s' ".self::singleQuote(base64_encode($database))." | base64 -d)\"",
+            'mysqldump --defaults-extra-file="$CNF" '.$options.' -- "$DB"',
             'rc=$?',
             'rm -f "$CNF"',
             'exit $rc',

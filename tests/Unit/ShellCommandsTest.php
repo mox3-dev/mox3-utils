@@ -71,10 +71,24 @@ class ShellCommandsTest extends TestCase
         $this->assertStringNotContainsString('s3cr3t"pw', $cmd);
         $expectedConfig = "[client]\nuser=\"root\"\npassword=\"s3cr3t\\\"pw\"\n";
         $this->assertStringContainsString(base64_encode($expectedConfig), $cmd);
-        // Database is single-quoted in the remote mysqldump invocation.
-        $this->assertStringContainsString("--defaults-extra-file=\"\$CNF\" --single-transaction 'app'", $cmd);
+        // Database is shipped as base64 and used as a quoted, decoded var — never literal text.
+        $this->assertStringContainsString(base64_encode('app'), $cmd);
+        $this->assertStringContainsString('mysqldump --defaults-extra-file="$CNF" --single-transaction -- "$DB"', $cmd);
         // No -p password flag anywhere.
         $this->assertStringNotContainsString(' -p', $cmd);
+    }
+
+    public function test_ssh_dump_command_neutralizes_newline_injection_in_database_name(): void
+    {
+        $malicious = "x\nMOXDUMP\necho INJECTED\n";
+        $cmd = ShellCommands::sshDumpCommand('h', $malicious, '--quick', 'u', 'p', '/tmp/o.gz');
+
+        // The malicious text is never present as literal heredoc-body content...
+        $this->assertStringNotContainsString('echo INJECTED', $cmd);
+        // ...only its base64 form is.
+        $this->assertStringContainsString(base64_encode($malicious), $cmd);
+        // Exactly the opener + terminator occurrences of the delimiter, nothing injected.
+        $this->assertSame(2, substr_count($cmd, 'MOXDUMP'));
     }
 
     public function test_reset_database_sql_escapes_backticks_in_name(): void
