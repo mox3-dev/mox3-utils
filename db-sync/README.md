@@ -1,57 +1,39 @@
 # Database Sync Utility
 
-A bash script to sync a remote MySQL database to your local development environment via SSH.
+Two ways to pull a remote MySQL database down to local (and, for Laravel, push it
+to a remote target):
 
-## Features
+- **Laravel projects** — the `db:sync-production` Artisan command, shipped by the
+  `mox3-dev/mox3-utils` Composer package.
+- **WordPress / non-Laravel projects** — the `sync-db.sh` bash script (config-file driven).
 
-- Connects to remote server via SSH (no direct MySQL port exposure needed)
-- Runs `mysqldump` on the remote server (avoids local MySQL version compatibility issues)
-- Automatically drops and recreates local database
-- Cleans up temp files on completion
-- Colored output for easy status tracking
+## Laravel: `db:sync-production` (Composer package)
 
-## Requirements
+### Install (per project, one-time)
 
-- SSH key-based authentication to remote server
-- MySQL client installed locally
-- `mysqldump` available on remote server
+Add the repository and require the package:
 
-## Installation
-
-### Bash Script
+```jsonc
+// composer.json
+"repositories": [
+    { "type": "vcs", "url": "git@github.com:mox3-dev/mox3-utils.git" }
+]
+```
 
 ```bash
-# Symlink to your project
-ln -s ~/Sites/mox3-utils/db-sync/sync-db.sh ./sync-db.sh
-
-# Or copy
-cp ~/Sites/mox3-utils/db-sync/sync-db.sh ./sync-db.sh
-chmod +x ./sync-db.sh
+composer require mox3-dev/mox3-utils
 ```
 
-### Laravel Artisan Command
+The command auto-registers via Laravel package discovery — no `config/app.php` edit needed.
 
-```bash
-cp ~/Sites/mox3-utils/db-sync/SyncProductionDatabase.php app/Console/Commands/
-```
+### Configure the source (and optional target) connection
 
-Add these to your `.env`:
-
-```env
-PRODUCTION_DB_HOST=127.0.0.1
-PRODUCTION_DB_DATABASE=your_db_name
-PRODUCTION_DB_USERNAME=forge
-PRODUCTION_DB_PASSWORD=your_password
-
-PRODUCTION_SSH_HOST=your-server-ip
-PRODUCTION_SSH_USER=forge
-```
-
-Add a `production` connection in `config/database.php`:
+Add a `production` connection in `config/database.php` (and a `staging` one if you
+will use `--push-remote`), then set the connection + access details in `.env`.
 
 ```php
 'production' => [
-    'driver' => env('PRODUCTION_DB_DRIVER', 'mysql'),
+    'driver' => 'mysql',
     'host' => env('PRODUCTION_DB_HOST', '127.0.0.1'),
     'port' => env('PRODUCTION_DB_PORT', '3306'),
     'database' => env('PRODUCTION_DB_DATABASE'),
@@ -59,134 +41,82 @@ Add a `production` connection in `config/database.php`:
     'password' => env('PRODUCTION_DB_PASSWORD'),
     'charset' => 'utf8mb4',
     'collation' => 'utf8mb4_unicode_ci',
-    'prefix' => '',
-    'strict' => true,
 ],
 ```
 
-Then run:
+### Access modes (per connection, via `.env`)
+
+`<CONN>_ACCESS` chooses how the connection is reached (`<CONN>` is the connection
+name upper-cased with `-` → `_`, e.g. `production` → `PRODUCTION`).
+
+**Cloudways / Forge (`ssh` — run mysqldump on the remote host):**
+```env
+PRODUCTION_ACCESS=ssh
+PRODUCTION_SSH=forge@your-server-ip
+PRODUCTION_DB_DATABASE=your_db
+PRODUCTION_DB_USERNAME=your_db_user
+PRODUCTION_DB_PASSWORD=your_db_pass
+```
+
+**Tunnel (`tunnel` — auto-open an SSH tunnel, e.g. mortrack):**
+```env
+PRODUCTION_ACCESS=tunnel
+PRODUCTION_TUNNEL_SSH=bastion-user@ec2-host
+PRODUCTION_TUNNEL_REMOTE=db.internal:3306
+PRODUCTION_TUNNEL_LOCAL_PORT=13306
+PRODUCTION_DB_DATABASE=your_db
+PRODUCTION_DB_USERNAME=your_db_user
+PRODUCTION_DB_PASSWORD=your_db_pass
+```
+
+**Direct (`direct` — default; local mysqldump straight at host/port):**
+```env
+PRODUCTION_ACCESS=direct
+PRODUCTION_DB_HOST=127.0.0.1
+PRODUCTION_DB_PORT=3306
+```
+
+### Usage
 
 ```bash
+# Mode 1 — just save a dump file (storage/app/exports/*.sql.gz)
+php artisan db:sync-production --dump-only
+
+# Mode 2 — dump remote → drop/recreate LOCAL → import (the default)
 php artisan db:sync-production
-php artisan db:sync-production --force    # Skip confirmation
-php artisan db:sync-production --backup   # Backup local DB first
+php artisan db:sync-production --backup      # back up local first
+php artisan db:sync-production --data-only   # skip table structure
+php artisan db:sync-production --force        # skip the confirmation
+
+# Mode 3 — dump remote → drop/recreate a REMOTE target → import (guarded)
+php artisan db:sync-production --push-remote --target-connection=staging --force
 ```
 
-## Configuration
+Options: `--source-connection=` (default `production`), `--target-connection=`,
+`--dump-only`, `--push-remote`, `--keep-dump`, `--backup`, `--data-only`, `--force`.
 
-Create a `.db-sync.conf` file in your project root:
+### Safety
 
-```bash
-# Copy the example config
-cp ~/Sites/mox3-utils/db-sync/.db-sync.conf.example ./.db-sync.conf
-```
+- Credentials for local `mysqldump`/`mysql` go through a temporary 0600
+  `--defaults-extra-file`, never on the command line. The `ssh` path sends the
+  remote option file over SSH stdin, so no password appears in any process list.
+- `--push-remote` is destructive on a remote server: it requires `--force`, prints
+  the exact host/DB to be dropped, and refuses when the target host:port + database
+  equals the source being dumped.
 
-Edit `.db-sync.conf` with your connection details:
+### Verification checklist
 
-```bash
-# SSH Configuration
-SSH_HOST="your-server.com"
-SSH_PORT="22"
-SSH_USER="your-ssh-user"
+- `--dump-only` produces a non-empty `.sql.gz` in `storage/app/exports/`.
+- Local import round-trips: source and local base-table counts match.
+- `--push-remote` without `--force` (or without `--target-connection`) refuses.
+- While a dump runs, `ps aux | grep mysqldump` shows no password.
+- `tunnel` access opens the tunnel, dumps, then leaves no lingering `ssh -L` process.
 
-# Remote MySQL Configuration
-REMOTE_DB_HOST="127.0.0.1"
-REMOTE_DB_USER="db_username"
-REMOTE_DB_PASS="db_password"
-REMOTE_DB_NAME="production_db_name"
+## WordPress / non-Laravel: `sync-db.sh`
 
-# Local MySQL Configuration
-LOCAL_DB_HOST="127.0.0.1"
-LOCAL_DB_PORT="3306"
-LOCAL_DB_USER="root"
-LOCAL_DB_PASS=""
-LOCAL_DB_NAME="local_db_name"
-```
-
-**Important:** Add `.db-sync.conf` to your `.gitignore` to avoid committing credentials!
-
-```bash
-echo ".db-sync.conf" >> .gitignore
-```
-
-## Usage
-
-### Basic usage (uses .db-sync.conf in current directory)
-
-```bash
-./sync-db.sh
-```
-
-### Specify a config file
-
-```bash
-./sync-db.sh /path/to/custom-config.conf
-```
-
-### Example output
-
-```
-╔════════════════════════════════════════╗
-║      Database Sync Utility             ║
-╚════════════════════════════════════════╝
-
-Remote: master_user@146.190.119.63 → production_db
-Local:  root@127.0.0.1 → local_db
-
-[1/4] Testing SSH connection...
-✓ SSH connection successful
-[2/4] Dumping remote database via SSH...
-       (this may take a few minutes for large databases)
-✓ Database dump complete (6.9M)
-[3/4] Resetting local database...
-✓ Local database reset
-[4/4] Importing to local database...
-✓ Import complete
-
-╔════════════════════════════════════════╗
-║           Sync Complete!               ║
-╚════════════════════════════════════════╝
-Database 'production_db' synced to local 'local_db'
-```
-
-## Troubleshooting
-
-### SSH Connection Failed
-
-```bash
-# Test SSH connection manually
-ssh your-user@your-server.com -p 22
-
-# Check if your SSH key is added
-ssh-add -l
-
-# Add your SSH key if needed
-ssh-add ~/.ssh/id_rsa
-```
-
-### MySQL Authentication Error
-
-Make sure the MySQL credentials in your config are correct. Test on the remote server:
-
-```bash
-ssh your-user@your-server.com
-mysql -u db_user -p db_name -e "SELECT 1"
-```
-
-### Empty Dump File
-
-Check if `mysqldump` is available on the remote server and the database exists:
-
-```bash
-ssh your-user@your-server.com "which mysqldump"
-ssh your-user@your-server.com "mysql -u db_user -p -e 'SHOW DATABASES'"
-```
-
-## Security Notes
-
-1. **Never commit `.db-sync.conf`** - Add it to `.gitignore`
-2. **Use SSH keys** - Password authentication is not supported
-3. **Restrict database user permissions** - Use a read-only user if possible
+A framework-agnostic bash script driven by a `.db-sync.conf` file. See the script
+header for configuration. (Note: `sync-db.sh` and `.db-sync.conf.example` are being
+restored separately.)
 
 ## License
 
