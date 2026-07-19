@@ -56,4 +56,35 @@ class AccessSettingsTest extends TestCase
         $this->assertTrue($s->isSsh());
         $this->assertSame('forge@1.2.3.4', $s->sshTarget);
     }
+
+    public function test_identity_matches_direct_and_tunnel_pointing_at_same_physical_db(): void
+    {
+        $direct = AccessSettings::fromConnection('production', [
+            'host' => 'db.internal', 'port' => 3306, 'username' => 'u', 'password' => 'p', 'database' => 'app',
+        ], $this->env([]));
+
+        $tunnel = AccessSettings::fromConnection('staging', [
+            'host' => '127.0.0.1', 'port' => 3306, 'username' => 'u', 'password' => 'p', 'database' => 'app',
+        ], $this->env([
+            'STAGING_ACCESS' => 'tunnel',
+            'STAGING_TUNNEL_SSH' => 'bastion',
+            'STAGING_TUNNEL_REMOTE' => 'db.internal:3306',
+            'STAGING_TUNNEL_LOCAL_PORT' => '13306',
+        ]));
+
+        $this->assertSame($direct->identity(), $tunnel->identity());
+    }
+
+    public function test_identity_differs_for_distinct_ssh_hosts_with_same_local_endpoint(): void
+    {
+        $a = AccessSettings::fromConnection('a', [
+            'host' => '127.0.0.1', 'port' => 3306, 'username' => 'u', 'password' => 'p', 'database' => 'app',
+        ], $this->env(['A_ACCESS' => 'ssh', 'A_SSH' => 'forge@box1']));
+
+        $b = AccessSettings::fromConnection('b', [
+            'host' => '127.0.0.1', 'port' => 3306, 'username' => 'u', 'password' => 'p', 'database' => 'app',
+        ], $this->env(['B_ACCESS' => 'ssh', 'B_SSH' => 'forge@box2']));
+
+        $this->assertNotSame($a->identity(), $b->identity());
+    }
 }

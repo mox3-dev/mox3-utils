@@ -52,4 +52,29 @@ final class AccessSettings
     {
         return $this->isTunnel() ? (int) $this->tunnelLocalPort : $this->port;
     }
+
+    /**
+     * Canonical identity of the physical database endpoint, normalized across
+     * access strategies so a direct/tunnel pair pointing at the same remote DB
+     * compares equal. Used to refuse pushing into the source being dumped.
+     */
+    public function identity(): string
+    {
+        if ($this->isTunnel()) {
+            return $this->normalizeHostPort((string) $this->tunnelRemote);
+        }
+
+        if ($this->isSsh()) {
+            return strtolower((string) $this->sshTarget).'/'.$this->normalizeHostPort($this->host.':'.$this->port);
+        }
+
+        return $this->normalizeHostPort($this->host.':'.$this->port);
+    }
+
+    private function normalizeHostPort(string $hostPort): string
+    {
+        [$host, $port] = array_pad(explode(':', $hostPort, 2), 2, '3306');
+
+        return strtolower(trim($host)).':'.trim($port);
+    }
 }

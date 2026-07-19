@@ -142,11 +142,14 @@ class SyncProductionDatabase extends Command
             return null;
         }
 
-        if (ShellCommands::sameEndpoint(
-            $source->effectiveHost(), $source->effectivePort(),
-            $target->effectiveHost(), $target->effectivePort()
-        ) && $source->database === $target->database) {
-            $this->error('Refusing to import into the same host:port + database being dumped.');
+        if ($target->isSsh()) {
+            $this->error("--push-remote does not support an 'ssh'-access target ('{$targetConnection}'): a secure remote import cannot keep credentials off the command line over ssh-exec. Use 'tunnel' access to reach the target's database (or 'direct' if it is directly reachable).");
+
+            return null;
+        }
+
+        if ($source->identity() === $target->identity() && $source->database === $target->database) {
+            $this->error('Refusing to import into the same physical database being dumped (source and target resolve to the same endpoint).');
 
             return null;
         }

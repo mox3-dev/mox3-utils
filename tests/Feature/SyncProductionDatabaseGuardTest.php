@@ -22,6 +22,10 @@ class SyncProductionDatabaseGuardTest extends TestCase
             'driver' => 'mysql', 'host' => 'db.example.com', 'port' => 3306,
             'username' => 'u', 'password' => 'p', 'database' => 'prod_app',
         ]);
+        $app['config']->set('database.connections.staging', [
+            'driver' => 'mysql', 'host' => '127.0.0.1', 'port' => 3306,
+            'username' => 'u', 'password' => 'p', 'database' => 'staging_app',
+        ]);
     }
 
     public function test_command_is_registered(): void
@@ -58,5 +62,25 @@ class SyncProductionDatabaseGuardTest extends TestCase
         $this->artisan('db:sync-production', ['--source-connection' => 'testing', '--dump-only' => true])
             ->expectsOutputToContain('not a configured MySQL connection')
             ->assertExitCode(1);
+    }
+
+    public function test_push_remote_rejects_ssh_access_target(): void
+    {
+        putenv('STAGING_ACCESS=ssh');
+        $_ENV['STAGING_ACCESS'] = 'ssh';
+        $_SERVER['STAGING_ACCESS'] = 'ssh';
+
+        try {
+            $this->artisan('db:sync-production', [
+                '--push-remote' => true,
+                '--target-connection' => 'staging',
+                '--force' => true,
+            ])
+                ->expectsOutputToContain("does not support an 'ssh'-access target")
+                ->assertExitCode(1);
+        } finally {
+            putenv('STAGING_ACCESS');
+            unset($_ENV['STAGING_ACCESS'], $_SERVER['STAGING_ACCESS']);
+        }
     }
 }

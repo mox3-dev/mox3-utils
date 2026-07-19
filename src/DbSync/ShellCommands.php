@@ -69,8 +69,9 @@ final class ShellCommands
      * credentials from a temp 0600 option file we ship as base64 over the SSH
      * stdin (a quoted heredoc bound to ssh, before the gzip pipe) — so no
      * password ever reaches any argv, the base64 payload cannot collide with
-     * the heredoc terminator, and the database name is single-quoted against
-     * remote injection. ssh's stdout is piped to gzip into the local dump file.
+     * the heredoc terminator, and the database name now travels as base64 and
+     * is decoded into a remote shell variable (quoted "$DB"), never embedded
+     * as literal text. ssh's stdout is piped to gzip into the local dump file.
      * The database name also travels as base64 and is decoded into a remote
      * shell variable, so untrusted bytes (e.g. a newline matching the heredoc
      * terminator) are never embedded as literal text in the local heredoc body.

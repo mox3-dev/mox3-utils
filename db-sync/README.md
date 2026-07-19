@@ -92,6 +92,11 @@ php artisan db:sync-production --force        # skip the confirmation
 php artisan db:sync-production --push-remote --target-connection=staging --force
 ```
 
+Note: the `--target-connection` for `--push-remote` must use `direct` or `tunnel`
+access — `ssh`-access targets are rejected (a secure remote import cannot keep
+credentials off the command line over ssh-exec). Use `tunnel` access to reach a
+remote target's database.
+
 Options: `--source-connection=` (default `production`), `--target-connection=`,
 `--dump-only`, `--push-remote`, `--keep-dump`, `--backup`, `--data-only`, `--force`.
 
