@@ -121,11 +121,45 @@ final class ShellCommands
         return "'".str_replace("'", "'\\''", $value)."'";
     }
 
-    public static function importCommand(string $mysqlBin, string $cnf, string $database, string $dumpFile): string
+    /**
+     * Strip DEFINER=`user`@`host` clauses from triggers/views/routines/events.
+     * Runs always — the source server's account (e.g. root3@%) does not exist on
+     * the target and would abort the import with Error 1449. LC_ALL=C so awk
+     * treats the stream as raw bytes (binary blob bytes crash a UTF-8 locale awk).
+     */
+    public static function definerStripFilter(): string
     {
+        return 'LC_ALL=C awk \'{ gsub(/DEFINER=`[^`]+`@`[^`]+`/, ""); print }\'';
+    }
+
+    /**
+     * Physically remove `CONSTRAINT ... FOREIGN KEY` DDL lines (and fix the
+     * dangling comma on the preceding line). Legacy FKs referencing non-unique
+     * columns are rejected at CREATE time by MySQL 8.0.19+/8.4/9.x — a structural
+     * rejection SET FOREIGN_KEY_CHECKS=0 cannot bypass. Anchored to DDL
+     * indentation so data lines are untouched. LC_ALL=C for raw-byte safety.
+     */
+    public static function foreignKeyStripFilter(): string
+    {
+        return 'LC_ALL=C awk \'{ if ($0 ~ /^[[:space:]]*CONSTRAINT `[^`]+` FOREIGN KEY/) next; if (h) { if ($0 ~ /^\)/ && p ~ /,[[:space:]]*$/) sub(/,[[:space:]]*$/, "", p); print p } p=$0; h=1 } END { if (h) print p }\'';
+    }
+
+    public static function importCommand(string $mysqlBin, string $cnf, string $database, string $dumpFile, bool $stripForeignKeys = false): string
+    {
+        $preamble = "SET SESSION innodb_strict_mode=0; SET FOREIGN_KEY_CHECKS=0; SET SQL_MODE='NO_AUTO_VALUE_ON_ZERO';";
+        $postamble = 'SET FOREIGN_KEY_CHECKS=1;';
+
+        $filters = self::definerStripFilter();
+        if ($stripForeignKeys) {
+            $filters .= ' | '.self::foreignKeyStripFilter();
+        }
+
         return sprintf(
-            'gunzip < %s | %s --defaults-extra-file=%s --max_allowed_packet=512M %s',
+            '( echo %s; gunzip < %s; echo %s ) | %s | %s --defaults-extra-file=%s --max_allowed_packet=512M --net_buffer_length=16384 %s',
+            escapeshellarg($preamble),
             escapeshellarg($dumpFile),
+            escapeshellarg($postamble),
+            $filters,
             escapeshellarg($mysqlBin),
             escapeshellarg($cnf),
             escapeshellarg($database)

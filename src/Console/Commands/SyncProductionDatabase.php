@@ -21,6 +21,7 @@ class SyncProductionDatabase extends Command
                             {--keep-dump : Keep the dump file after import}
                             {--backup : Back up the destination DB before overwriting it}
                             {--data-only : Dump data only (skip CREATE TABLE structure)}
+                            {--strip-foreign-keys : Drop FK constraints during import (for MySQL 8.4+/9.x targets that reject legacy FKs referencing non-unique columns)}
                             {--force : Skip the destructive-action confirmation}';
 
     protected $description = 'Dump a remote MySQL database and optionally import it into a local or remote target.';
@@ -221,7 +222,13 @@ class SyncProductionDatabase extends Command
     {
         $this->info("Importing into {$target->database}");
         $cnf = $this->optionFileFor($target);
-        $command = ShellCommands::importCommand($this->binary('mysql'), $cnf, $target->database, $dumpFile);
+        $command = ShellCommands::importCommand(
+            $this->binary('mysql'),
+            $cnf,
+            $target->database,
+            $dumpFile,
+            (bool) $this->option('strip-foreign-keys')
+        );
         $this->runShell($command, 'import');
     }
 
@@ -243,6 +250,7 @@ class SyncProductionDatabase extends Command
             ['Source', $source->describe()],
             ['Destination', $dest],
             ['Data only', $this->option('data-only') ? 'yes' : 'no'],
+            ['Strip foreign keys', $this->option('strip-foreign-keys') ? 'yes' : 'no'],
         ]);
     }
 

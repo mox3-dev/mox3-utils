@@ -57,6 +57,36 @@ class ShellCommandsTest extends TestCase
         $cmd = ShellCommands::importCommand('mysql', '/tmp/cnf', 'app', '/tmp/out.sql.gz');
         $this->assertStringContainsString('gunzip <', $cmd);
         $this->assertStringContainsString('--defaults-extra-file', $cmd);
+        // Always wraps the stream in the legacy-data session pragmas...
+        $this->assertStringContainsString('SET FOREIGN_KEY_CHECKS=0', $cmd);
+        $this->assertStringContainsString("SQL_MODE=", $cmd);
+        $this->assertStringContainsString('SET FOREIGN_KEY_CHECKS=1', $cmd);
+        // ...pipes through the DEFINER-strip filter, and raises net_buffer_length.
+        $this->assertStringContainsString(ShellCommands::definerStripFilter(), $cmd);
+        $this->assertStringContainsString('--net_buffer_length=16384', $cmd);
+    }
+
+    public function test_import_command_without_flag_strips_definer_but_not_foreign_keys(): void
+    {
+        $cmd = ShellCommands::importCommand('mysql', '/tmp/cnf', 'app', '/tmp/out.sql.gz', false);
+        $this->assertStringContainsString(ShellCommands::definerStripFilter(), $cmd);
+        $this->assertStringContainsString('SET FOREIGN_KEY_CHECKS=0', $cmd);
+        // The FK-strip awk program is NOT present when the flag is off.
+        $this->assertStringNotContainsString(ShellCommands::foreignKeyStripFilter(), $cmd);
+        $this->assertStringNotContainsString('CONSTRAINT', $cmd);
+    }
+
+    public function test_import_command_with_flag_also_strips_foreign_keys(): void
+    {
+        $cmd = ShellCommands::importCommand('mysql', '/tmp/cnf', 'app', '/tmp/out.sql.gz', true);
+        $this->assertStringContainsString(ShellCommands::definerStripFilter(), $cmd);
+        $this->assertStringContainsString(ShellCommands::foreignKeyStripFilter(), $cmd);
+    }
+
+    public function test_strip_filters_run_under_raw_byte_locale_awk(): void
+    {
+        $this->assertStringStartsWith('LC_ALL=C awk', ShellCommands::definerStripFilter());
+        $this->assertStringStartsWith('LC_ALL=C awk', ShellCommands::foreignKeyStripFilter());
     }
 
     public function test_ssh_dump_command_ships_credentials_as_base64_over_ssh_stdin(): void
