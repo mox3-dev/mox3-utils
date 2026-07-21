@@ -3,7 +3,9 @@
 namespace Mox3\Utils\Console\Commands;
 
 use Illuminate\Console\Command;
+use InvalidArgumentException;
 use Mox3\Utils\DbSync\AccessSettings;
+use Mox3\Utils\DbSync\DatabaseTargets;
 use Mox3\Utils\DbSync\MysqlOptionFile;
 use Mox3\Utils\DbSync\ShellCommands;
 use Mox3\Utils\DbSync\SshTunnel;
@@ -22,6 +24,7 @@ class SyncProductionDatabase extends Command
                             {--backup : Back up the destination DB before overwriting it}
                             {--data-only : Dump data only (skip CREATE TABLE structure)}
                             {--strip-foreign-keys : Drop FK constraints during import (for MySQL 8.4+/9.x targets that reject legacy FKs referencing non-unique columns)}
+                            {--databases=* : Sync multiple databases (repeatable or comma-separated). Each item is a DB name, or source:target to rename the target. Overrides the connection database.}
                             {--force : Skip the destructive-action confirmation}';
 
     protected $description = 'Dump a remote MySQL database and optionally import it into a local or remote target.';
@@ -56,28 +59,103 @@ class SyncProductionDatabase extends Command
             }
         }
 
-        $this->printSummary($source, $target, $dumpOnly);
+        try {
+            $pairs = $this->databasePairs($source, $target);
+        } catch (InvalidArgumentException $e) {
+            $this->error($e->getMessage());
 
-        if (! $dumpOnly && ! $this->option('force')
-            && ! $this->confirm("This ERASES the target database '{$target->database}' and replaces it. Proceed?")) {
-            $this->info('Cancelled.');
-
-            return self::SUCCESS;
+            return self::FAILURE;
         }
 
+        $this->printSummary($source, $target, $dumpOnly, $pairs);
+
+        if (! $dumpOnly && ! $this->option('force')) {
+            $targets = implode(', ', array_map(static fn (array $p): string => "'{$p[1]}'", $pairs));
+            if (! $this->confirm("This ERASES the target database(s) {$targets} and replaces them. Proceed?")) {
+                $this->info('Cancelled.');
+
+                return self::SUCCESS;
+            }
+        }
+
+        // Tunnels depend only on the endpoint, not the database, so open once.
         try {
             $this->openTunnelIfNeeded($source);
             if ($target !== null) {
                 $this->openTunnelIfNeeded($target);
             }
 
+            $results = [];
+            $anyFailed = false;
+
+            foreach ($pairs as [$srcDb, $tgtDb]) {
+                $jobSource = $source->withDatabase($srcDb);
+                $jobTarget = $target?->withDatabase($tgtDb);
+
+                try {
+                    $this->guardNotSelfOverwrite($jobSource, $jobTarget);
+                    $this->syncOne($jobSource, $jobTarget, $dumpOnly);
+                    $results[] = [$srcDb, $tgtDb, 'ok'];
+                } catch (Throwable $e) {
+                    $anyFailed = true;
+                    $this->error("[{$srcDb}] failed: ".$e->getMessage());
+                    $results[] = [$srcDb, $tgtDb, 'FAILED — '.$e->getMessage()];
+                }
+            }
+
+            if (count($pairs) > 1 || $anyFailed) {
+                $this->printResults($results, $dumpOnly);
+            }
+
+            return $anyFailed ? self::FAILURE : self::SUCCESS;
+        } finally {
+            $this->closeInfra();
+        }
+    }
+
+    /**
+     * Resolve the ordered [sourceDb, targetDb] jobs. With --databases, each
+     * entry overrides both sides (target defaults to the source name). Without
+     * it, a single job derived from each connection's configured database —
+     * exactly the pre-existing single-DB behavior.
+     *
+     * @return list<array{0:string, 1:string}>
+     */
+    private function databasePairs(AccessSettings $source, ?AccessSettings $target): array
+    {
+        $pairs = DatabaseTargets::parse((array) $this->option('databases'));
+        if ($pairs !== []) {
+            return $pairs;
+        }
+
+        return [[$source->database, $target?->database ?? $source->database]];
+    }
+
+    /** Refuse to import into the exact physical database being dumped. */
+    private function guardNotSelfOverwrite(AccessSettings $source, ?AccessSettings $target): void
+    {
+        if ($target !== null
+            && $source->identity() === $target->identity()
+            && $source->database === $target->database) {
+            throw new RuntimeException(
+                "refusing to overwrite '{$source->database}' with itself (source and target resolve to the same endpoint)."
+            );
+        }
+    }
+
+    /** Full dump → (backup) → reset → import lifecycle for one database. */
+    private function syncOne(AccessSettings $source, ?AccessSettings $target, bool $dumpOnly): void
+    {
+        $dumpFile = null;
+
+        try {
             $dumpFile = $this->buildDumpPath($source->database);
             $this->dump($source, $dumpFile);
 
             if ($dumpOnly) {
                 $this->info("Dump only — no database touched. File: {$dumpFile}");
 
-                return self::SUCCESS;
+                return;
             }
 
             if ($this->option('backup')) {
@@ -87,17 +165,14 @@ class SyncProductionDatabase extends Command
             $this->resetTarget($target);
             $this->importInto($target, $dumpFile);
             $this->info("Import complete into '{$target->database}'.");
-
-            return self::SUCCESS;
-        } catch (Throwable $e) {
-            if (isset($dumpFile) && is_file($dumpFile) && ! $this->option('keep-dump')) {
-                @unlink($dumpFile);
-            }
-            $this->error('Sync failed: '.$e->getMessage());
-
-            return self::FAILURE;
         } finally {
-            $this->cleanup($dumpFile ?? null, $dumpOnly);
+            if ($dumpFile !== null && is_file($dumpFile)) {
+                if ($dumpOnly || $this->option('keep-dump')) {
+                    $this->line("Dump kept at: {$dumpFile}");
+                } else {
+                    @unlink($dumpFile);
+                }
+            }
         }
     }
 
@@ -240,18 +315,38 @@ class SyncProductionDatabase extends Command
         return $cnf;
     }
 
-    private function printSummary(AccessSettings $source, ?AccessSettings $target, bool $dumpOnly): void
+    /** @param list<array{0:string, 1:string}> $pairs */
+    private function printSummary(AccessSettings $source, ?AccessSettings $target, bool $dumpOnly, array $pairs): void
     {
         $dest = $dumpOnly || $target === null
             ? 'none (dump only — writes a file)'
             : $target->describe().'  (DROPPED + recreated)';
 
+        $dbList = implode(', ', array_map(
+            static fn (array $p): string => $p[0] === $p[1] ? $p[0] : "{$p[0]} → {$p[1]}",
+            $pairs
+        ));
+
         $this->table(['Setting', 'Value'], [
             ['Source', $source->describe()],
             ['Destination', $dest],
+            ['Databases ('.count($pairs).')', $dbList],
             ['Data only', $this->option('data-only') ? 'yes' : 'no'],
             ['Strip foreign keys', $this->option('strip-foreign-keys') ? 'yes' : 'no'],
         ]);
+    }
+
+    /** @param list<array{0:string, 1:string, 2:string}> $results */
+    private function printResults(array $results, bool $dumpOnly): void
+    {
+        $this->line('');
+        $this->table(
+            ['Source DB', 'Target DB', 'Result'],
+            array_map(
+                static fn (array $r): array => [$r[0], $dumpOnly ? '—' : $r[1], $r[2]],
+                $results
+            )
+        );
     }
 
     private function buildDumpPath(string $database): string
@@ -287,7 +382,8 @@ class SyncProductionDatabase extends Command
         }
     }
 
-    private function cleanup(?string $dumpFile, bool $dumpOnly): void
+    /** Tear down shared infrastructure once at the end: temp option files + tunnels. */
+    private function closeInfra(): void
     {
         foreach ($this->tempFiles as $file) {
             @unlink($file);
@@ -298,15 +394,5 @@ class SyncProductionDatabase extends Command
             $tunnel->close();
         }
         $this->tunnels = [];
-
-        if ($dumpFile === null || ! is_file($dumpFile)) {
-            return;
-        }
-
-        if ($dumpOnly || $this->option('keep-dump')) {
-            $this->line("Dump kept at: {$dumpFile}");
-        } else {
-            @unlink($dumpFile);
-        }
     }
 }

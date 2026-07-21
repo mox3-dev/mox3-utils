@@ -117,6 +117,22 @@ class AccessSettingsTest extends TestCase
         $this->assertStringContainsString('tunnel', $desc);
     }
 
+    public function test_with_database_clones_endpoint_and_only_swaps_the_database(): void
+    {
+        $s = AccessSettings::fromConnection('production', [
+            'host' => '127.0.0.1', 'port' => 3306, 'username' => 'u', 'password' => 'p', 'database' => 'app',
+        ], $this->env(['PRODUCTION_ACCESS' => 'ssh', 'PRODUCTION_SSH' => 'forge@1.2.3.4']));
+
+        $other = $s->withDatabase('billing');
+
+        $this->assertSame('billing', $other->database);
+        $this->assertSame('app', $s->database, 'original is left untouched (immutable)');
+        // Everything else — access, host, creds, ssh target — carries over unchanged.
+        $this->assertSame($s->access, $other->access);
+        $this->assertSame($s->sshTarget, $other->sshTarget);
+        $this->assertSame($s->identity(), $other->identity());
+    }
+
     public function test_describe_shows_host_port_for_direct_access(): void
     {
         $s = AccessSettings::fromConnection('production', [

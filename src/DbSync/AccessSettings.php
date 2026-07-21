@@ -37,6 +37,22 @@ final class AccessSettings
         );
     }
 
+    /** Clone this endpoint pointed at a different database (same host/creds/access). */
+    public function withDatabase(string $database): self
+    {
+        return new self(
+            access: $this->access,
+            host: $this->host,
+            port: $this->port,
+            username: $this->username,
+            password: $this->password,
+            database: $database,
+            sshTarget: $this->sshTarget,
+            tunnelRemote: $this->tunnelRemote,
+            tunnelLocalPort: $this->tunnelLocalPort,
+        );
+    }
+
     public function isDirect(): bool { return $this->access === 'direct'; }
 
     public function isSsh(): bool { return $this->access === 'ssh'; }

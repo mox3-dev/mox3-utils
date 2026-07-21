@@ -90,6 +90,14 @@ php artisan db:sync-production --force        # skip the confirmation
 
 # Mode 3 — dump remote → drop/recreate a REMOTE target → import (guarded)
 php artisan db:sync-production --push-remote --target-connection=staging --force
+
+# Multiple databases in one run (repeatable or comma-separated).
+# Each target takes the source name unless you map it with source:target.
+php artisan db:sync-production --databases=app,billing
+php artisan db:sync-production --databases=prod_app:local_app --databases=prod_logs:local_logs
+
+# Legacy schemas whose FKs reference non-unique columns (rejected by MySQL 8.4+/9.x)
+php artisan db:sync-production --strip-foreign-keys
 ```
 
 Note: the `--target-connection` for `--push-remote` must use `direct` or `tunnel`
@@ -98,7 +106,16 @@ credentials off the command line over ssh-exec). Use `tunnel` access to reach a
 remote target's database.
 
 Options: `--source-connection=` (default `production`), `--target-connection=`,
-`--dump-only`, `--push-remote`, `--keep-dump`, `--backup`, `--data-only`, `--force`.
+`--dump-only`, `--push-remote`, `--keep-dump`, `--backup`, `--data-only`,
+`--databases=*` (repeatable/comma-separated; `db` or `source:target`),
+`--strip-foreign-keys`, `--force`.
+
+With `--databases`, every DB is synced independently: one dump file each, a
+failure on one does not abort the rest, and a per-database result table is
+printed at the end (the command exits non-zero if any database failed). DEFINER
+clauses are always stripped on import; `--strip-foreign-keys` additionally drops
+`CONSTRAINT … FOREIGN KEY` DDL for targets on MySQL 8.4+/9.x that reject legacy
+foreign keys referencing non-unique columns.
 
 ### Safety
 
