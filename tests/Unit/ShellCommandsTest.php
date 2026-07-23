@@ -52,6 +52,59 @@ class ShellCommandsTest extends TestCase
         $this->assertStringNotContainsString('-p', $cmd); // no password on the command line
     }
 
+    public function test_append_dump_options_omit_structure_level_flags(): void
+    {
+        $opts = ShellCommands::appendDumpOptions(false);
+        // Base dump flags are present...
+        $this->assertStringContainsString('--single-transaction', $opts);
+        $this->assertStringContainsString('--set-gtid-purged=OFF', $opts);
+        // ...but the DB-level structure flags are NOT re-emitted in the append pass.
+        $this->assertStringNotContainsString('--routines', $opts);
+        $this->assertStringNotContainsString('--triggers', $opts);
+        $this->assertStringNotContainsString('--events', $opts);
+        // Not data-only: the trimmed table keeps its CREATE TABLE.
+        $this->assertStringNotContainsString('--no-create-info', $opts);
+    }
+
+    public function test_append_dump_options_respect_data_only(): void
+    {
+        $this->assertStringContainsString('--no-create-info', ShellCommands::appendDumpOptions(true));
+    }
+
+    public function test_direct_dump_command_with_no_ignore_tables_is_byte_identical(): void
+    {
+        $without = ShellCommands::directDumpCommand('mysqldump', '/tmp/cnf', '--single-transaction', 'app', '/tmp/out.sql.gz');
+        $withEmpty = ShellCommands::directDumpCommand('mysqldump', '/tmp/cnf', '--single-transaction', 'app', '/tmp/out.sql.gz', []);
+        $this->assertSame($without, $withEmpty);
+        $this->assertStringNotContainsString('--ignore-table', $without);
+    }
+
+    public function test_direct_dump_command_emits_one_ignore_table_per_entry(): void
+    {
+        $cmd = ShellCommands::directDumpCommand(
+            'mysqldump', '/tmp/cnf', '--single-transaction', 'app', '/tmp/out.sql.gz',
+            ['logs_api_v3', 'log']
+        );
+        $this->assertStringContainsString("--ignore-table='app.logs_api_v3'", $cmd);
+        $this->assertStringContainsString("--ignore-table='app.log'", $cmd);
+        // Ignore args precede the database and the gzip pipe stays intact.
+        $this->assertMatchesRegularExpression("/--ignore-table='app.log' .*'app' \\| gzip > /", $cmd);
+    }
+
+    public function test_direct_append_command_filters_with_where_and_appends(): void
+    {
+        $cmd = ShellCommands::appendDumpCommand(
+            'mysqldump', '/tmp/cnf', '--single-transaction', 'app', 'logs_api_v3',
+            '`timestamp` >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)', '/tmp/out.sql.gz'
+        );
+        $this->assertStringContainsString('--defaults-extra-file', $cmd);
+        $this->assertStringContainsString('--where=', $cmd);
+        $this->assertStringContainsString('DATE_SUB(CURDATE(), INTERVAL 30 DAY)', $cmd);
+        // Dumps exactly the one table, and APPENDS to the existing gzip.
+        $this->assertMatchesRegularExpression("/'app' 'logs_api_v3' \\| gzip >> /", $cmd);
+        $this->assertStringNotContainsString(' -p', $cmd);
+    }
+
     public function test_import_command_gunzips_into_mysql_client(): void
     {
         $cmd = ShellCommands::importCommand('mysql', '/tmp/cnf', 'app', '/tmp/out.sql.gz');
@@ -108,6 +161,62 @@ class ShellCommandsTest extends TestCase
         $this->assertStringNotContainsString(' -p', $cmd);
     }
 
+    public function test_ssh_dump_command_with_no_ignore_tables_is_byte_identical(): void
+    {
+        $without = ShellCommands::sshDumpCommand('forge@host', 'app', '--single-transaction', 'root', 'pw', '/tmp/out.sql.gz');
+        $withEmpty = ShellCommands::sshDumpCommand('forge@host', 'app', '--single-transaction', 'root', 'pw', '/tmp/out.sql.gz', []);
+        $this->assertSame($without, $withEmpty);
+        $this->assertStringNotContainsString('ignore-table', $without);
+    }
+
+    public function test_ssh_dump_command_ships_ignore_tables_as_base64_never_literal(): void
+    {
+        $cmd = ShellCommands::sshDumpCommand(
+            'forge@host', 'app', '--single-transaction', 'root', 'pw', '/tmp/out.sql.gz',
+            ['logs_api_v3', 'log']
+        );
+        // Table names travel only inside the base64 blob, never as literal heredoc bytes.
+        $this->assertStringContainsString(base64_encode("logs_api_v3\nlog"), $cmd);
+        $this->assertStringNotContainsString('logs_api_v3', str_replace(base64_encode("logs_api_v3\nlog"), '', $cmd));
+        // The remote builds --ignore-table args and still dumps to the same gzip file.
+        $this->assertStringContainsString('--ignore-table="$DB.$t"', $cmd);
+        $this->assertMatchesRegularExpression("/<<'MOXDUMP' \\| gzip > /s", $cmd);
+        // Heredoc delimiter appears exactly twice (opener + terminator) — nothing injected.
+        $this->assertSame(2, substr_count($cmd, 'MOXDUMP'));
+    }
+
+    public function test_ssh_append_command_filters_with_where_and_appends(): void
+    {
+        $cmd = ShellCommands::sshAppendCommand(
+            'forge@host', 'app', 'logs_api_v3', '--single-transaction', 'root', 's3cr3t"pw',
+            '`timestamp` >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)', '/tmp/out.sql.gz'
+        );
+        // Appends to the existing gzip, over ssh.
+        $this->assertMatchesRegularExpression("/<<'MOXDUMP' \\| gzip >> /s", $cmd);
+        // Password, where clause, and table name all ship as base64 — never plaintext.
+        $this->assertStringNotContainsString('s3cr3t"pw', $cmd);
+        $this->assertStringNotContainsString('DATE_SUB(CURDATE(), INTERVAL 30 DAY)', $cmd);
+        $this->assertStringContainsString(base64_encode('`timestamp` >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)'), $cmd);
+        $this->assertStringContainsString(base64_encode('logs_api_v3'), $cmd);
+        $this->assertStringContainsString('mysqldump --defaults-extra-file="$CNF" --single-transaction --where="$WHERE" -- "$DB" "$TBL"', $cmd);
+    }
+
+    public function test_ssh_query_command_runs_mysql_with_base64_sql_and_no_plaintext_creds(): void
+    {
+        $sql = "SELECT table_name FROM information_schema.tables WHERE table_schema='app'";
+        $cmd = ShellCommands::sshQueryCommand('forge@host', 'root', 's3cr3t"pw', $sql);
+
+        // Runs a batch (-N) query; SQL travels as base64, decoded into a shell var.
+        $this->assertStringContainsString('mysql --defaults-extra-file="$CNF" -N -e "$SQL"', $cmd);
+        $this->assertStringContainsString(base64_encode($sql), $cmd);
+        $this->assertStringNotContainsString('information_schema.tables', str_replace(base64_encode($sql), '', $cmd));
+        // Credentials ship inside the option file, never on argv.
+        $this->assertStringNotContainsString('s3cr3t"pw', $cmd);
+        $this->assertStringNotContainsString(' -p', $cmd);
+        // No gzip — the rows come back on stdout.
+        $this->assertStringNotContainsString('gzip', $cmd);
+    }
+
     public function test_ssh_dump_command_neutralizes_newline_injection_in_database_name(): void
     {
         $malicious = "x\nMOXDUMP\necho INJECTED\n";
@@ -125,5 +234,40 @@ class ShellCommandsTest extends TestCase
     {
         $sql = ShellCommands::resetDatabaseSql('we`ird');
         $this->assertStringContainsString('DROP DATABASE IF EXISTS `we``ird`', $sql);
+    }
+
+    public function test_retention_cutoff_uses_date_sub_for_datetime_columns(): void
+    {
+        $where = ShellCommands::retentionCutoffSql('created_at', 'datetime', 30);
+        $this->assertSame('`created_at` >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)', $where);
+
+        $this->assertSame(
+            '`login` >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)',
+            ShellCommands::retentionCutoffSql('login', 'timestamp', 7)
+        );
+    }
+
+    public function test_retention_cutoff_wraps_epoch_columns_in_unix_timestamp(): void
+    {
+        foreach (['int', 'bigint', 'smallint', 'mediumint', 'tinyint', 'decimal', 'float', 'double'] as $type) {
+            $where = ShellCommands::retentionCutoffSql('timestamp', $type, 30);
+            $this->assertSame(
+                '`timestamp` >= UNIX_TIMESTAMP(DATE_SUB(CURDATE(), INTERVAL 30 DAY))',
+                $where,
+                "epoch handling for {$type}"
+            );
+        }
+    }
+
+    public function test_retention_cutoff_is_case_insensitive_on_data_type(): void
+    {
+        $this->assertStringContainsString('UNIX_TIMESTAMP', ShellCommands::retentionCutoffSql('t', 'INT', 30));
+        $this->assertStringNotContainsString('UNIX_TIMESTAMP', ShellCommands::retentionCutoffSql('t', 'DATETIME', 30));
+    }
+
+    public function test_retention_cutoff_doubles_backticks_in_column_name(): void
+    {
+        $where = ShellCommands::retentionCutoffSql('we`ird', 'datetime', 30);
+        $this->assertStringStartsWith('`we``ird` >=', $where);
     }
 }

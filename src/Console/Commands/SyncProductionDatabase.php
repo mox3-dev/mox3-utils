@@ -7,8 +7,15 @@ use InvalidArgumentException;
 use Mox3\Utils\DbSync\AccessSettings;
 use Mox3\Utils\DbSync\DatabaseTargets;
 use Mox3\Utils\DbSync\MysqlOptionFile;
+use Mox3\Utils\DbSync\PdoIntrospector;
 use Mox3\Utils\DbSync\ShellCommands;
+use Mox3\Utils\DbSync\SourceIntrospector;
+use Mox3\Utils\DbSync\SshIntrospector;
 use Mox3\Utils\DbSync\SshTunnel;
+use Mox3\Utils\DbSync\TrimPlan;
+use Mox3\Utils\DbSync\TrimPlanner;
+use Mox3\Utils\DbSync\TrimSpec;
+use PDO;
 use RuntimeException;
 use Symfony\Component\Process\Process;
 use Throwable;
@@ -25,6 +32,9 @@ class SyncProductionDatabase extends Command
                             {--data-only : Dump data only (skip CREATE TABLE structure)}
                             {--strip-foreign-keys : Drop FK constraints during import (for MySQL 8.4+/9.x targets that reject legacy FKs referencing non-unique columns)}
                             {--databases=* : Sync multiple databases (repeatable or comma-separated). Each item is a DB name, or source:target to rename the target. Overrides the connection database.}
+                            {--trim-logs : Dump configured log tables filtered to the last --log-days days instead of in full (config mox3-utils.trim_tables + --trim-table). Works over direct/tunnel/ssh access.}
+                            {--log-days=30 : Retention window in days for --trim-logs}
+                            {--trim-table=* : Ad-hoc trim override table:column (table may be db.table). Repeatable; wins over config.}
                             {--force : Skip the destructive-action confirmation}';
 
     protected $description = 'Dump a remote MySQL database and optionally import it into a local or remote target.';
@@ -42,6 +52,12 @@ class SyncProductionDatabase extends Command
 
         if ($dumpOnly && $pushRemote) {
             $this->error('--dump-only and --push-remote cannot be combined.');
+
+            return self::FAILURE;
+        }
+
+        if ($this->option('trim-logs') && (int) $this->option('log-days') < 1) {
+            $this->error('--log-days must be at least 1.');
 
             return self::FAILURE;
         }
@@ -248,6 +264,23 @@ class SyncProductionDatabase extends Command
     private function dump(AccessSettings $source, string $dumpFile): void
     {
         $this->info("Dumping {$source->database} → {$dumpFile}");
+
+        $plan = $this->resolveTrimPlan($source);
+
+        if ($plan !== null && ! $plan->isEmpty()) {
+            $this->trimmedDump($source, $dumpFile, $plan);
+        } else {
+            $this->fullDump($source, $dumpFile);
+        }
+
+        if (! is_file($dumpFile) || filesize($dumpFile) === 0) {
+            throw new RuntimeException('dump produced an empty file — aborting before touching the target.');
+        }
+    }
+
+    /** The original single-pass full dump — unchanged behavior. */
+    private function fullDump(AccessSettings $source, string $dumpFile): void
+    {
         $options = ShellCommands::dumpOptions((bool) $this->option('data-only'));
 
         if ($source->isSsh()) {
@@ -263,10 +296,124 @@ class SyncProductionDatabase extends Command
         }
 
         $this->runShell($command, 'dump');
+    }
+
+    /**
+     * Two-pass dump: pass 1 dumps the whole DB minus the trimmed tables, pass 2
+     * appends each trimmed table filtered to the retention window. A non-empty
+     * guard runs between the passes so we never start appending onto a half dump.
+     */
+    private function trimmedDump(AccessSettings $source, string $dumpFile, TrimPlan $plan): void
+    {
+        $dataOnly = (bool) $this->option('data-only');
+        $mainOptions = ShellCommands::dumpOptions($dataOnly);
+        $appendOptions = ShellCommands::appendDumpOptions($dataOnly);
+        $days = (int) $this->option('log-days');
+        $ssh = $source->isSsh();
+        $cnf = $ssh ? null : $this->optionFileFor($source);
+
+        // Pass 1 — full DB minus the trimmed tables.
+        if ($ssh) {
+            $main = ShellCommands::sshDumpCommand(
+                (string) $source->sshTarget, $source->database, $mainOptions,
+                $source->username, $source->password, $dumpFile, $plan->tables()
+            );
+        } else {
+            $main = ShellCommands::directDumpCommand(
+                $this->binary('mysqldump'), $cnf, $mainOptions, $source->database, $dumpFile, $plan->tables()
+            );
+        }
+        $this->runShell($main, 'dump (main pass)');
 
         if (! is_file($dumpFile) || filesize($dumpFile) === 0) {
-            throw new RuntimeException('dump produced an empty file — aborting before touching the target.');
+            throw new RuntimeException('main dump pass produced an empty file — aborting before appends.');
         }
+
+        // Pass 2 — append each trimmed table with its WHERE filter.
+        foreach ($plan->wheres as $table => $where) {
+            $this->line("  trimming {$table} (last {$days} days)");
+
+            if ($ssh) {
+                $append = ShellCommands::sshAppendCommand(
+                    (string) $source->sshTarget, $source->database, $table, $appendOptions,
+                    $source->username, $source->password, $where, $dumpFile
+                );
+            } else {
+                $append = ShellCommands::appendDumpCommand(
+                    $this->binary('mysqldump'), $cnf, $appendOptions, $source->database, $table, $where, $dumpFile
+                );
+            }
+            $this->runShell($append, "dump {$table}");
+        }
+    }
+
+    /**
+     * Resolve the trim plan for this source, or null when trimming is off or no
+     * rules apply (either falls back to a full dump). Prints any bare-name
+     * missing-column warnings.
+     */
+    private function resolveTrimPlan(AccessSettings $source): ?TrimPlan
+    {
+        if (! $this->option('trim-logs')) {
+            return null;
+        }
+
+        $spec = TrimSpec::fromConfigAndCli(
+            (array) config('mox3-utils.trim_tables', []),
+            (array) $this->option('trim-table')
+        );
+
+        if ($spec->isEmpty()) {
+            $this->warn('--trim-logs is set but no trim tables are configured (mox3-utils.trim_tables / --trim-table) — dumping in full.');
+
+            return null;
+        }
+
+        $plan = (new TrimPlanner($spec, $this->introspectorFor($source)))
+            ->plan($source->database, (int) $this->option('log-days'));
+
+        foreach ($plan->warnings as $warning) {
+            $this->warn('  '.$warning);
+        }
+
+        return $plan;
+    }
+
+    /** PDO introspection for direct/tunnel, SSH-exec introspection for ssh. */
+    private function introspectorFor(AccessSettings $source): SourceIntrospector
+    {
+        if ($source->isSsh()) {
+            return new SshIntrospector(
+                fn (string $command): string => $this->runShellCapture($command, 'introspect'),
+                (string) $source->sshTarget,
+                $source->username,
+                $source->password
+            );
+        }
+
+        $pdo = $this->pdoFor($source);
+
+        return new PdoIntrospector(function (string $sql, array $params) use ($pdo): array {
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($params);
+
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        });
+    }
+
+    private function pdoFor(AccessSettings $source): PDO
+    {
+        $dsn = sprintf(
+            'mysql:host=%s;port=%d;charset=%s',
+            $source->effectiveHost(),
+            $source->effectivePort(),
+            ShellCommands::CHARSET
+        );
+
+        return new PDO($dsn, $source->username, $source->password, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_TIMEOUT => 10,
+        ]);
     }
 
     private function backupDestination(AccessSettings $target): void
@@ -333,6 +480,9 @@ class SyncProductionDatabase extends Command
             ['Databases ('.count($pairs).')', $dbList],
             ['Data only', $this->option('data-only') ? 'yes' : 'no'],
             ['Strip foreign keys', $this->option('strip-foreign-keys') ? 'yes' : 'no'],
+            ['Log tables', $this->option('trim-logs')
+                ? 'trimmed to last '.(int) $this->option('log-days').' days'
+                : 'full'],
         ]);
     }
 
@@ -380,6 +530,20 @@ class SyncProductionDatabase extends Command
         if (! $process->isSuccessful()) {
             throw new RuntimeException("{$label} failed (exit {$process->getExitCode()}).");
         }
+    }
+
+    /** Run a shell command and return its stdout (used for ssh introspection). */
+    private function runShellCapture(string $command, string $label): string
+    {
+        $process = new Process(['bash', '-c', 'set -o pipefail; '.$command]);
+        $process->setTimeout(null);
+        $process->run();
+
+        if (! $process->isSuccessful()) {
+            throw new RuntimeException("{$label} failed (exit {$process->getExitCode()}).");
+        }
+
+        return $process->getOutput();
     }
 
     /** Tear down shared infrastructure once at the end: temp option files + tunnels. */
