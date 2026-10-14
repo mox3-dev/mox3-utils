@@ -511,9 +511,16 @@ class SyncProductionDatabase extends Command
 
     private function binary(string $name): string
     {
-        $brew = "/opt/homebrew/opt/mysql-client@8.0/bin/{$name}";
+        // MySQL 9+ clients dropped mysql_native_password, which many hosts
+        // still use, so prefer an 8.x Homebrew client over whatever is on PATH.
+        foreach (['8.4', '8.0'] as $version) {
+            $brew = "/opt/homebrew/opt/mysql-client@{$version}/bin/{$name}";
+            if (is_executable($brew)) {
+                return $brew;
+            }
+        }
 
-        return is_executable($brew) ? $brew : $name;
+        return $name;
     }
 
     private function runShell(string $command, string $label): void
