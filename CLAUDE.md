@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 The sample deployment workflow is designed for Laravel applications and includes:
 
 **Build Process:**
-- PHP 8.3 setup with Composer dependency installation (optimized, no-dev)
+- PHP 8.5 setup with Composer dependency installation (optimized, no-dev)
 - Node.js 20 setup with npm dependencies and asset building
 
 **Deployment Process:**
